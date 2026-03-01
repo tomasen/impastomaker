@@ -1,0 +1,5 @@
+Pillow>=9.0
+numpy>=1.21
+opencv-python-headless>=4.5
+scipy>=1.7
+scikit-image>=0.19
