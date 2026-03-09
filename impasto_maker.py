@@ -1071,7 +1071,8 @@ def generate_mesh_for_region(label_map, heightmap, color_idx, canvas_z, px_mm):
     top_z = np.full((VH, VW), canvas_z, dtype=np.float64)
     top_z[valid] = (top_z_sum[valid] / top_z_count[valid]) + canvas_z
 
-    x_all = np.tile(np.arange(VW, dtype=np.float64), VH) * px_mm + c0 * px_mm
+    total_W = label_map.shape[1]
+    x_all = (total_W - c0 - np.tile(np.arange(VW, dtype=np.float64), VH)) * px_mm
     y_all = np.repeat(np.arange(VH, dtype=np.float64), VW) * px_mm + r0 * px_mm
     z_top = top_z.ravel()
     z_bot = np.full_like(z_top, canvas_z)
