@@ -54,6 +54,8 @@ BAMBU_PLA_BASIC = [
     ("Hot Pink",        "#F5547C", (245, 84, 124)),
     ("Pink",            "#F55A74", (245, 90, 116)),
     ("Maroon Red",      "#9D2235", (157, 34, 53)),
+    ("Beige",           "#F7E6DE", (247, 230, 222)),
+    ("Brown",           "#9D432C", (157, 67, 44)),
     ("Cocoa Brown",     "#6F5034", (111, 80, 52)),
     ("Bronze",          "#847D48", (132, 125, 72)),
     ("Dark Gray",       "#545454", (84, 84, 84)),
@@ -72,6 +74,179 @@ CANVAS_COLOR = ("Canvas", "#F0F0F0", (240, 240, 240))
 _bambu_rgb_arr = np.array([[c[2] for c in BAMBU_PLA_BASIC]], dtype=np.uint8)
 _BAMBU_LAB = cv2.cvtColor(_bambu_rgb_arr, cv2.COLOR_RGB2Lab).reshape(-1, 3).astype(np.float64)
 _BAMBU_HSV = cv2.cvtColor(_bambu_rgb_arr, cv2.COLOR_RGB2HSV).reshape(-1, 3).astype(np.float64)
+
+
+# ---------------------------------------------------------------------------
+# Filament name resolution
+# ---------------------------------------------------------------------------
+def _levenshtein(s1, s2):
+    """Compute Levenshtein edit distance between two strings."""
+    if len(s1) < len(s2):
+        return _levenshtein(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    prev = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        curr = [i + 1]
+        for j, c2 in enumerate(s2):
+            cost = 0 if c1 == c2 else 1
+            curr.append(min(curr[j] + 1, prev[j + 1] + 1, prev[j] + cost))
+        prev = curr
+    return prev[-1]
+
+
+def resolve_filament_names(names_str):
+    """Parse comma-separated filament names and resolve against BAMBU_PLA_BASIC.
+
+    Returns list of indices into BAMBU_PLA_BASIC.
+    Exits with helpful error if any name cannot be matched.
+    """
+    name_to_idx = {}
+    for i, (name, _, _) in enumerate(BAMBU_PLA_BASIC):
+        name_to_idx[name.lower().strip()] = i
+
+    raw_names = [n.strip() for n in names_str.split(",") if n.strip()]
+    if not raw_names:
+        print("Error: --filaments requires at least one color name.", file=sys.stderr)
+        sys.exit(1)
+
+    indices = []
+    errors = []
+    for raw in raw_names:
+        key = raw.lower().strip()
+        if key in name_to_idx:
+            indices.append(name_to_idx[key])
+        else:
+            all_names = [(name, i) for i, (name, _, _) in enumerate(BAMBU_PLA_BASIC)]
+            distances = [(name, i, _levenshtein(key, name.lower()))
+                         for name, i in all_names]
+            distances.sort(key=lambda x: x[2])
+            best_name, _, best_dist = distances[0]
+            if best_dist <= max(3, len(raw) // 2):
+                errors.append(f"  '{raw}' not found. Did you mean '{best_name}'?")
+            else:
+                errors.append(f"  '{raw}' not found in Bambu PLA Basic palette.")
+
+    if errors:
+        print("Error resolving filament names:", file=sys.stderr)
+        for e in errors:
+            print(e, file=sys.stderr)
+        print("\nAvailable colors:", file=sys.stderr)
+        for name, hex_code, _ in BAMBU_PLA_BASIC:
+            print(f"  {name} ({hex_code})", file=sys.stderr)
+        sys.exit(1)
+
+    # Deduplicate preserving order
+    seen = set()
+    deduped = []
+    for idx in indices:
+        if idx in seen:
+            print(f"Warning: Duplicate filament '{BAMBU_PLA_BASIC[idx][0]}', "
+                  f"keeping first occurrence.", file=sys.stderr)
+        else:
+            seen.add(idx)
+            deduped.append(idx)
+
+    return deduped
+
+
+def extract_filaments_from_3mf(path):
+    """Extract filament colors from a 3MF file and match to BAMBU_PLA_BASIC.
+
+    Reads Metadata/project_settings.config from the 3MF ZIP, parses the
+    filament_colour JSON array, and finds the nearest BAMBU_PLA_BASIC color
+    for each hex code.
+
+    Returns list of indices into BAMBU_PLA_BASIC.
+    """
+    if not os.path.isfile(path):
+        print(f"Error: 3MF file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        with zipfile.ZipFile(path, 'r') as zf:
+            config_path = None
+            for candidate in ["Metadata/project_settings.config",
+                              "metadata/project_settings.config"]:
+                if candidate in zf.namelist():
+                    config_path = candidate
+                    break
+
+            if config_path is None:
+                print(f"Error: No project_settings.config found in {path}",
+                      file=sys.stderr)
+                sys.exit(1)
+
+            config_data = json.loads(zf.read(config_path))
+    except zipfile.BadZipFile:
+        print(f"Error: {path} is not a valid ZIP/3MF file", file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError:
+        print(f"Error: project_settings.config in {path} is not valid JSON",
+              file=sys.stderr)
+        sys.exit(1)
+
+    filament_colours = config_data.get("filament_colour", [])
+    if not filament_colours:
+        print(f"Error: No filament_colour array in {path}", file=sys.stderr)
+        sys.exit(1)
+
+    # Filter out empty/transparent slots
+    hex_codes = [c for c in filament_colours
+                 if c and c not in ("#00000000", "")]
+
+    if not hex_codes:
+        print(f"Error: No valid filament colors in {path}", file=sys.stderr)
+        sys.exit(1)
+
+    indices = []
+    seen = set()
+    for hex_code in hex_codes:
+        h = hex_code.lstrip("#")
+        if len(h) >= 6:
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        else:
+            print(f"Warning: Skipping invalid hex code '{hex_code}'",
+                  file=sys.stderr)
+            continue
+
+        # Try exact RGB match first
+        exact_match = None
+        for i, (name, _, bam_rgb) in enumerate(BAMBU_PLA_BASIC):
+            if bam_rgb == (r, g, b):
+                exact_match = i
+                break
+
+        if exact_match is not None:
+            if exact_match not in seen:
+                indices.append(exact_match)
+                seen.add(exact_match)
+                print(f"    3MF filament {hex_code} -> "
+                      f"{BAMBU_PLA_BASIC[exact_match][0]} (exact match)")
+            continue
+
+        # Fall back to Lab distance
+        pixel_rgb = np.array([[[r, g, b]]], dtype=np.uint8)
+        pixel_lab = cv2.cvtColor(pixel_rgb, cv2.COLOR_RGB2Lab).reshape(3).astype(np.float64)
+        dists = np.linalg.norm(_BAMBU_LAB - pixel_lab, axis=1)
+        best_idx = int(np.argmin(dists))
+
+        if best_idx not in seen:
+            indices.append(best_idx)
+            seen.add(best_idx)
+            print(f"    3MF filament {hex_code} -> "
+                  f"{BAMBU_PLA_BASIC[best_idx][0]} "
+                  f"(nearest, Lab dist {dists[best_idx]:.1f})")
+        else:
+            print(f"    3MF filament {hex_code} -> "
+                  f"{BAMBU_PLA_BASIC[best_idx][0]} (already selected)")
+
+    if len(indices) < 2:
+        print(f"Error: Need at least 2 distinct filament colors from 3MF, "
+              f"got {len(indices)}", file=sys.stderr)
+        sys.exit(1)
+
+    return indices
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +281,8 @@ BAYER_4X4 = np.array([
 # ---------------------------------------------------------------------------
 # Stage 2+3: Direct Bambu PLA Palette Quantization (Lab color space)
 # ---------------------------------------------------------------------------
-def quantize_to_bambu_palette(image, n_colors=8, morph_kernel=5, min_area=100):
+def quantize_to_bambu_palette(image, n_colors=8, morph_kernel=5, min_area=100,
+                               fixed_indices=None):
     """Assign each pixel to Bambu PLA colors using greedy error minimization.
 
     Instead of simple nearest-neighbor counting, iteratively selects whichever
@@ -114,6 +290,8 @@ def quantize_to_bambu_palette(image, n_colors=8, morph_kernel=5, min_area=100):
     diverse palette: adding a redundant shade barely helps when a similar color
     already covers those pixels, so distinct colors that serve under-represented
     regions get selected instead.
+
+    If fixed_indices is provided, skip greedy selection and use those colors.
 
     Returns (label_map, palette_rgb, bambu_colors).
     """
@@ -158,59 +336,87 @@ def quantize_to_bambu_palette(image, n_colors=8, morph_kernel=5, min_area=100):
             sat_penalty = SAT_WEIGHT * desat
             all_dists[s:e, c] = (lab_d + hue_penalty + sat_penalty).astype(np.float32)
 
-    # Step 2: greedy selection — each step picks the color that most reduces
-    # total assignment error (sum of nearest-selected-color distances)
-    best_dist = np.full(n_pixels, 1e30, dtype=np.float32)
-    selected = []
-    for i in range(n_colors):
-        remaining = [c for c in range(n_bambu) if c not in selected]
-        errors = np.array([
-            np.minimum(best_dist, all_dists[:, c]).sum() for c in remaining])
-        best_c = remaining[int(np.argmin(errors))]
-        selected.append(best_c)
-        best_dist = np.minimum(best_dist, all_dists[:, best_c])
-        pct = (all_dists[:, best_c] <= best_dist + 0.01).sum() / n_pixels * 100
-        print(f"    #{i+1} {BAMBU_PLA_BASIC[best_c][0]:20s} "
-              f"{BAMBU_PLA_BASIC[best_c][1]}  ({pct:.1f}% closest)")
+    # Step 2: color selection — greedy or user-specified
+    if fixed_indices is not None:
+        # User-specified palette: skip greedy selection
+        selected = list(fixed_indices)
+        n_colors = len(selected)
+        print("    Using user-specified filament palette:")
+        for i, c in enumerate(selected):
+            nearest = (all_dists[:, c] <= np.min(
+                all_dists[:, selected], axis=1) + 0.01).sum()
+            pct = nearest / n_pixels * 100
+            print(f"    #{i+1} {BAMBU_PLA_BASIC[c][0]:20s} "
+                  f"{BAMBU_PLA_BASIC[c][1]}  ({pct:.1f}% closest)")
+    else:
+        # Greedy selection — each step picks the color that most reduces
+        # total assignment error. Stops early if improvement < 2%.
+        best_dist = np.full(n_pixels, 1e30, dtype=np.float32)
+        selected = []
+        for i in range(n_colors):
+            remaining = [c for c in range(n_bambu) if c not in selected]
+            errors = np.array([
+                np.minimum(best_dist, all_dists[:, c]).sum() for c in remaining])
+            best_c = remaining[int(np.argmin(errors))]
 
-    # Step 2b: diversity check — replace redundant close colors
-    MIN_PALETTE_DELTA_E = 25.0
-    blacklist = set()  # colors that have been dropped (prevent re-selection)
-    replaced = True
-    while replaced:
-        replaced = False
-        for i in range(len(selected)):
-            for j in range(i + 1, len(selected)):
-                d = np.linalg.norm(_BAMBU_LAB[selected[i]] - _BAMBU_LAB[selected[j]])
-                if d < MIN_PALETTE_DELTA_E:
-                    drop_idx = j  # later pick = less impactful
-                    dropped_c = selected[drop_idx]
-                    dropped_name = BAMBU_PLA_BASIC[dropped_c][0]
-                    blacklist.add(dropped_c)
-                    selected.pop(drop_idx)
-                    # Re-run greedy for the freed slot (excluding blacklist)
-                    best_dist_temp = np.full(n_pixels, 1e30, dtype=np.float32)
-                    for s_idx in selected:
-                        best_dist_temp = np.minimum(best_dist_temp,
-                                                    all_dists[:, s_idx])
-                    remaining = [c for c in range(n_bambu)
-                                 if c not in selected and c not in blacklist]
-                    if not remaining:
-                        # No alternatives left, restore the dropped color
-                        selected.insert(drop_idx, dropped_c)
-                        blacklist.discard(dropped_c)
-                        break
-                    errors = np.array([
-                        np.minimum(best_dist_temp, all_dists[:, c]).sum()
-                        for c in remaining])
-                    best_c = remaining[int(np.argmin(errors))]
-                    selected.append(best_c)
-                    print(f"    Replaced {dropped_name} (too close) → "
-                          f"{BAMBU_PLA_BASIC[best_c][0]}")
-                    replaced = True
-                    break
-            if replaced:
+            # Early stopping: if adding this color barely helps, stop
+            error_before = best_dist.sum()
+            new_dist = np.minimum(best_dist, all_dists[:, best_c])
+            error_after = new_dist.sum()
+            if error_before > 0:
+                improvement = (error_before - error_after) / error_before
+            else:
+                improvement = 0.0
+
+            if i >= 3 and improvement < 0.02:
+                print(f"    Stopping at {i} colors "
+                      f"(next adds only {improvement*100:.1f}% improvement)")
                 break
+
+            selected.append(best_c)
+            best_dist = new_dist
+            pct = (all_dists[:, best_c] <= best_dist + 0.01).sum() / n_pixels * 100
+            print(f"    #{i+1} {BAMBU_PLA_BASIC[best_c][0]:20s} "
+                  f"{BAMBU_PLA_BASIC[best_c][1]}  ({pct:.1f}% closest)")
+
+        n_colors = len(selected)  # may be less than requested
+
+        # Step 2b: diversity check — replace redundant close colors
+        MIN_PALETTE_DELTA_E = 25.0
+        blacklist = set()
+        replaced = True
+        while replaced:
+            replaced = False
+            for i in range(len(selected)):
+                for j in range(i + 1, len(selected)):
+                    d = np.linalg.norm(_BAMBU_LAB[selected[i]] - _BAMBU_LAB[selected[j]])
+                    if d < MIN_PALETTE_DELTA_E:
+                        drop_idx = j
+                        dropped_c = selected[drop_idx]
+                        dropped_name = BAMBU_PLA_BASIC[dropped_c][0]
+                        blacklist.add(dropped_c)
+                        selected.pop(drop_idx)
+                        best_dist_temp = np.full(n_pixels, 1e30, dtype=np.float32)
+                        for s_idx in selected:
+                            best_dist_temp = np.minimum(best_dist_temp,
+                                                        all_dists[:, s_idx])
+                        remaining = [c for c in range(n_bambu)
+                                     if c not in selected and c not in blacklist]
+                        if not remaining:
+                            selected.insert(drop_idx, dropped_c)
+                            blacklist.discard(dropped_c)
+                            break
+                        errors = np.array([
+                            np.minimum(best_dist_temp, all_dists[:, c]).sum()
+                            for c in remaining])
+                        best_c = remaining[int(np.argmin(errors))]
+                        selected.append(best_c)
+                        print(f"    Replaced {dropped_name} (too close) → "
+                              f"{BAMBU_PLA_BASIC[best_c][0]}")
+                        replaced = True
+                        break
+                if replaced:
+                    break
 
     del all_dists  # free ~250MB
     top_indices = np.array(selected)
@@ -263,6 +469,79 @@ def quantize_to_bambu_palette(image, n_colors=8, morph_kernel=5, min_area=100):
         print(f"    Dithered {n_dithered:,} pixels ({n_dithered/H/W*100:.1f}%)")
     del dither_dists
 
+    # Step 3c: detect and protect dark contour lines
+    gray_img = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    # Method 1: Adaptive threshold for absolutely dark areas
+    dark_abs = cv2.adaptiveThreshold(
+        gray_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, blockSize=11, C=15)
+    dark_abs = (dark_abs > 0) & (gray_img < 80)
+    # Method 2: Black-hat transform for locally dark lines
+    # Catches dark blue/indigo outlines that aren't pure black but are
+    # significantly darker than their surroundings (e.g., wave edge in Hokusai)
+    blackhat_kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    blackhat = cv2.morphologyEx(gray_img, cv2.MORPH_BLACKHAT, blackhat_kern)
+    dark_rel = (blackhat > 40) & (gray_img < 120)
+    # Combine both detections
+    thin_kern = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    dark_thresh = (dark_abs | dark_rel).astype(np.uint8) * 255
+    dark_thresh = cv2.morphologyEx(dark_thresh, cv2.MORPH_CLOSE, thin_kern)
+    # Keep only thin features (contour lines) — remove large dark blobs
+    # Morphological opening removes features thinner than the kernel;
+    # subtracting gives us ONLY the thin features that were removed.
+    blob_kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    dark_blobs = cv2.morphologyEx(dark_thresh, cv2.MORPH_OPEN, blob_kern)
+    dark_thresh[dark_blobs > 0] = 0  # remove blobs, keep thin lines only
+
+    # Find darkest selected color (lowest L* in Lab)
+    selected_brightness = [_BAMBU_LAB[top_indices[c]][0] for c in range(n_colors)]
+    darkest_idx = int(np.argmin(selected_brightness))
+    darkest_L = selected_brightness[darkest_idx]
+
+    # If significant dark strokes exist but no truly dark color is selected,
+    # force Black into the palette (replacing least impactful color)
+    dark_pixel_ratio = (dark_thresh > 0).sum() / (H * W)
+    if dark_pixel_ratio > 0.005 and darkest_L > 30:
+        # Find Black in Bambu palette
+        black_idx = next(i for i, c in enumerate(BAMBU_PLA_BASIC)
+                         if c[0] == "Black")
+        if black_idx not in top_indices:
+            # Replace the color with lowest coverage
+            coverages = np.bincount(labels.ravel(), minlength=n_colors)
+            worst = int(np.argmin(coverages))
+            old_name = BAMBU_PLA_BASIC[top_indices[worst]][0]
+            top_indices[worst] = black_idx
+            darkest_idx = worst
+            # Re-assign labels for the replaced slot
+            selected_lab = _BAMBU_LAB[top_indices]
+            selected_hsv = _BAMBU_HSV[top_indices]
+            flat_lab = img_lab.reshape(-1, 3)
+            old_mask = labels == worst
+            if old_mask.any():
+                rl = flat_lab[old_mask.ravel()]
+                d = np.linalg.norm(
+                    rl[:, np.newaxis, :] - selected_lab[np.newaxis, :, :],
+                    axis=2)
+                labels[old_mask] = np.argmin(d, axis=1)
+            print(f"    Forced Black into palette (replaced {old_name}, "
+                  f"{dark_pixel_ratio*100:.1f}% dark strokes detected)")
+        else:
+            darkest_idx = int(np.where(top_indices == black_idx)[0][0])
+
+    # Contour mask: dark stroke pixels assigned to WRONG (light) colors
+    # Only reassign if pixel's current color is too bright for a dark stroke
+    # (In a dark painting like Pollock, dark pixels are already correctly
+    # assigned to dark colors — don't override those)
+    pixel_assigned_L = np.array([_BAMBU_LAB[top_indices[c]][0]
+                                 for c in range(n_colors)])
+    assigned_L_map = pixel_assigned_L[labels]
+    contour_mask = (dark_thresh > 0) & (assigned_L_map > 40)
+    n_contour = contour_mask.sum()
+    if n_contour > 0:
+        labels[contour_mask] = darkest_idx
+        print(f"    Protected {n_contour:,} dark contour pixels "
+              f"→ {BAMBU_PLA_BASIC[top_indices[darkest_idx]][0]}")
+
     # Step 4: morphological smoothing
     kern = np.ones((morph_kernel, morph_kernel), np.uint8)
     smoothed_masks = []
@@ -277,6 +556,10 @@ def quantize_to_bambu_palette(image, n_colors=8, morph_kernel=5, min_area=100):
     new_labels = np.full((H, W), -1, dtype=np.int32)
     for c in priority:
         new_labels[smoothed_masks[c] > 0] = c
+
+    # Restore protected contour lines after smoothing
+    if n_contour > 0:
+        new_labels[contour_mask] = darkest_idx
 
     # Fill unclaimed pixels
     unclaimed = new_labels == -1
@@ -295,12 +578,13 @@ def quantize_to_bambu_palette(image, n_colors=8, morph_kernel=5, min_area=100):
         new_labels[unclaimed] = np.argmin(dists, axis=1)
     labels = new_labels
 
-    # Step 5: remove small connected components
+    # Step 5: remove small connected components (lower threshold for dark contour color)
     for c in range(n_colors):
+        effective_min_area = 10 if c == darkest_idx else min_area
         mask_c = (labels == c).astype(np.uint8)
         n_comp, comp_labels, stats, _ = cv2.connectedComponentsWithStats(mask_c)
         for comp_id in range(1, n_comp):
-            if stats[comp_id, cv2.CC_STAT_AREA] < min_area:
+            if stats[comp_id, cv2.CC_STAT_AREA] < effective_min_area:
                 comp_pixels = comp_labels == comp_id
                 dilated = cv2.dilate(comp_pixels.astype(np.uint8), kern, iterations=1)
                 neighbor_region = (dilated > 0) & ~comp_pixels
@@ -332,22 +616,268 @@ def quantize_to_bambu_palette(image, n_colors=8, morph_kernel=5, min_area=100):
 # ---------------------------------------------------------------------------
 # Stage 4: Sculptural Heightmap (Two-Layer + Paint Stacking)
 # ---------------------------------------------------------------------------
-def compute_sculpture_layer(image, min_h, max_h, strategy="brightness"):
-    """Layer 1: Bas-relief depth from image luminance with bilateral smoothing."""
+def compute_depth_cues(image):
+    """Estimate relative depth from multiple visual cues.
+
+    Returns a normalized float32 array [0, 1] where 1 = foreground (tall)
+    and 0 = background (short).
+
+    Cues:
+      1. Edge density (high-frequency detail) — foreground has more detail
+      2. Color saturation — foreground more saturated (aerial perspective)
+      3. Vertical position — lower in frame = closer to viewer
+      4. Local contrast/variance — high variance = foreground detail
+    """
+    H, W = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY).astype(np.float32)
+
+    # --- Cue 1: Edge density (gradient magnitude, then large blur) ---
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(gx**2 + gy**2)
+    blur_size = max(1.0, max(H, W) * 0.08)
+    edge_density = gaussian_filter(grad_mag, sigma=blur_size)
+    ed_min, ed_max = edge_density.min(), edge_density.max()
+    if ed_max - ed_min > 1e-6:
+        edge_density = (edge_density - ed_min) / (ed_max - ed_min)
+    else:
+        edge_density = np.zeros_like(edge_density)
+
+    # --- Cue 2: Color saturation ---
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV).astype(np.float32)
+    saturation = hsv[:, :, 1] / 255.0
+    saturation = gaussian_filter(saturation, sigma=max(1.0, blur_size * 0.5))
+    sat_min, sat_max = saturation.min(), saturation.max()
+    if sat_max - sat_min > 1e-6:
+        saturation = (saturation - sat_min) / (sat_max - sat_min)
+    else:
+        saturation = np.zeros_like(saturation)
+
+    # --- Cue 3: Vertical position heuristic ---
+    vert_pos = np.linspace(0.0, 1.0, H, dtype=np.float32)[:, np.newaxis]
+    vert_pos = np.broadcast_to(vert_pos, (H, W)).copy()
+
+    # --- Cue 4: Local contrast (std dev in sliding window) ---
+    win_size = max(3, int(min(H, W) * 0.05))
+    if win_size % 2 == 0:
+        win_size += 1
+    mean = cv2.blur(gray, (win_size, win_size))
+    mean_sq = cv2.blur(gray**2, (win_size, win_size))
+    local_var = np.maximum(0.0, mean_sq - mean**2)
+    local_std = np.sqrt(local_var)
+    lv_min, lv_max = local_std.min(), local_std.max()
+    if lv_max - lv_min > 1e-6:
+        local_std = (local_std - lv_min) / (lv_max - lv_min)
+    else:
+        local_std = np.zeros_like(local_std)
+
+    # --- Combine cues ---
+    depth_score = (0.35 * edge_density +
+                   0.20 * saturation +
+                   0.20 * vert_pos +
+                   0.25 * local_std)
+
+    ds_min, ds_max = depth_score.min(), depth_score.max()
+    if ds_max - ds_min > 1e-6:
+        depth_score = (depth_score - ds_min) / (ds_max - ds_min)
+    else:
+        depth_score = np.zeros_like(depth_score)
+
+    return depth_score.astype(np.float32)
+
+
+def compute_ai_depth(image):
+    """Compute depth map using Depth Anything V2 Small model.
+
+    Returns normalized float32 array [0, 1] where 1 = foreground (tall).
+    Model downloads on first use (~100MB), runs on CPU.
+    """
+    try:
+        from transformers import pipeline as hf_pipeline
+    except ImportError:
+        print("  Warning: transformers not installed, falling back to heuristic depth.")
+        print("  Install with: pip install transformers torch")
+        return compute_depth_cues(image)
+
+    print("    Loading Depth Anything V2 model...")
+    pipe = hf_pipeline(task="depth-estimation",
+                       model="depth-anything/Depth-Anything-V2-Small-hf",
+                       device="cpu")
+
+    pil_img = Image.fromarray(image)
+    result = pipe(pil_img)
+    depth = np.array(result["depth"], dtype=np.float32)
+
+    # Resize to match input
+    H, W = image.shape[:2]
+    if depth.shape != (H, W):
+        depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_LINEAR)
+
+    # Normalize to [0, 1]
+    dmin, dmax = depth.min(), depth.max()
+    if dmax - dmin > 1e-6:
+        depth = (depth - dmin) / (dmax - dmin)
+    else:
+        depth = np.zeros_like(depth)
+
+    # Depth Anything outputs near=high values; we want foreground=tall=1.0
+    # Check: if top region (sky) has higher mean than bottom, invert
+    top_quarter = depth[:H//4, :].mean()
+    bot_quarter = depth[3*H//4:, :].mean()
+    if top_quarter > bot_quarter:
+        depth = 1.0 - depth
+
+    # Apply CLAHE for much better local contrast between depth regions
+    depth_u8 = (np.clip(depth, 0, 1) * 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+    depth = clahe.apply(depth_u8).astype(np.float32) / 255.0
+
+    # Percentile stretch to use full [0, 1] range
+    p2, p98 = np.percentile(depth, [2, 98])
+    if p98 - p2 > 1e-6:
+        depth = np.clip((depth - p2) / (p98 - p2), 0.0, 1.0)
+
+    return depth.astype(np.float32)
+
+
+def propagate_depth_through_objects(depth, image, n_iter=80):
+    """Propagate high depth within objects, stopped by image edges.
+
+    The wave foam has high depth (detailed, foreground). The adjacent dark
+    wave body has low depth (uniform, heuristic scores it poorly). But they
+    are the SAME object — no strong image edge between them. This function
+    spreads the foam's high depth into the wave body while the wave-sky
+    boundary (strong edge) acts as a barrier.
+
+    Uses a pyramid approach: operates at 1/4 resolution for efficiency,
+    giving an effective propagation radius of n_iter * 4 pixels.
+    """
+    H, W = depth.shape[:2]
+    scale = 4
+    small_H, small_W = H // scale, W // scale
+
+    # Compute edge barriers at full resolution (more accurate)
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad = np.sqrt(gx**2 + gy**2)
+    barrier_thresh = np.percentile(grad, 80)
+    edge_full = (grad > barrier_thresh).astype(np.uint8)
+    edge_full = cv2.dilate(edge_full, np.ones((5, 5), np.uint8))
+
+    # Downsample barriers with max-pooling (preserves thin barriers)
+    crop_H, crop_W = small_H * scale, small_W * scale
+    edge_crop = edge_full[:crop_H, :crop_W]
+    edge_small = edge_crop.reshape(small_H, scale, small_W, scale).max(axis=(1, 3))
+    edge_barrier = edge_small > 0
+
+    # Downsample depth
+    depth_small = cv2.resize(depth, (small_W, small_H),
+                             interpolation=cv2.INTER_LINEAR)
+
+    propagated = depth_small.copy()
+    kern = np.ones((3, 3), np.uint8)
+    decay = 0.998  # slight decay per step to limit propagation range
+
+    for _ in range(n_iter):
+        dilated = cv2.dilate(propagated, kern)
+        candidate = dilated * decay
+        # Propagate where no edge barrier; keep original at barriers
+        propagated = np.where(edge_barrier, propagated,
+                              np.maximum(propagated, candidate))
+
+    # Upsample back to full resolution
+    propagated_full = cv2.resize(propagated, (W, H),
+                                 interpolation=cv2.INTER_LINEAR)
+
+    # Blend: propagated (object-consistent) + original (per-pixel detail)
+    result = 0.7 * propagated_full + 0.3 * depth
+    return result.astype(np.float32)
+
+
+def compute_sculpture_layer(image, min_h, max_h, strategy="depth"):
+    """Layer 1: Bas-relief depth from image analysis.
+
+    Strategies:
+      - 'depth' (default): AI depth estimation (Depth Anything V2) blended
+        with brightness for surface detail. Foreground objects are tall.
+      - 'heuristic': Heuristic depth cues (edge density, saturation,
+        vertical position, local contrast) — no AI dependency.
+      - 'brightness': Original approach — dark pixels = tall.
+    """
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY).astype(np.float32)
     sigma_space = max(image.shape[:2]) * 0.05
     smoothed = cv2.bilateralFilter(gray, d=0, sigmaColor=50,
                                    sigmaSpace=sigma_space)
     smin, smax = float(smoothed.min()), float(smoothed.max())
     if smax - smin > 1e-6:
-        norm = (smoothed - smin) / (smax - smin)
+        brightness_norm = (smoothed - smin) / (smax - smin)
     else:
-        norm = np.zeros_like(smoothed)
+        brightness_norm = np.zeros_like(smoothed)
 
     if strategy == "brightness":
-        norm = 1.0 - norm  # darker = taller
+        norm = 1.0 - brightness_norm  # darker = taller
+        norm = np.power(norm, 0.8)
+        return (min_h + norm * (max_h - min_h)).astype(np.float64)
 
-    norm = np.power(norm, 0.8)
+    if strategy == "depth":
+        depth_ai = compute_ai_depth(image)
+        # Multi-scale heuristic: captures depth at different spatial scales
+        # Fine: catches detailed features (foam, strokes, edges)
+        depth_heur_fine = compute_depth_cues(image)
+        # Coarse: heavy blur merges foam+wave body into one "wave region"
+        # that has more edge density/saturation than the sky region
+        H_img, W_img = image.shape[:2]
+        sigma_coarse = max(H_img, W_img) * 0.02
+        image_coarse = cv2.GaussianBlur(image, (0, 0), sigmaX=sigma_coarse)
+        depth_heur_coarse = compute_depth_cues(image_coarse)
+        # Very coarse: large-scale object structure
+        sigma_vcoarse = max(H_img, W_img) * 0.05
+        image_vcoarse = cv2.GaussianBlur(image, (0, 0), sigmaX=sigma_vcoarse)
+        depth_heur_vcoarse = compute_depth_cues(image_vcoarse)
+        # Multi-scale heuristic maximum (each scale rescues different objects)
+        heur_multi = np.maximum(np.maximum(depth_heur_fine, depth_heur_coarse),
+                                depth_heur_vcoarse)
+        # AI depth at reduced weight (prevents sky inflation; AI gives
+        # similar values to sky and wave at the top of paintings)
+        raw_depth = np.maximum(heur_multi, 0.5 * depth_ai)
+        # Propagate high depth through connected objects (edge-aware)
+        print("    Propagating depth through objects...")
+        norm = propagate_depth_through_objects(raw_depth, image)
+        # Normalize
+        nmin, nmax = norm.min(), norm.max()
+        if nmax - nmin > 1e-6:
+            norm = (norm - nmin) / (nmax - nmin)
+        else:
+            norm = np.zeros_like(norm)
+        # Add high-frequency brightness detail (brushstroke texture)
+        blur_sigma = max(image.shape[:2]) * 0.03
+        brightness_lowfreq = gaussian_filter(brightness_norm, sigma=blur_sigma)
+        brightness_detail = brightness_norm - brightness_lowfreq
+        norm = norm - 0.08 * brightness_detail  # dark strokes slightly raised
+        # Renormalize
+        nmin, nmax = norm.min(), norm.max()
+        if nmax - nmin > 1e-6:
+            norm = (norm - nmin) / (nmax - nmin)
+        else:
+            norm = np.zeros_like(norm)
+        # S-curve centered at median for dramatic foreground/background separation
+        median_val = float(np.median(norm))
+        norm = 1.0 / (1.0 + np.exp(-12.0 * (norm - median_val)))
+        norm = (norm - norm.min()) / (norm.max() - norm.min() + 1e-8)
+        return (min_h + norm * (max_h - min_h)).astype(np.float64)
+
+    # heuristic strategy
+    depth_score = compute_depth_cues(image)
+    norm = 0.65 * depth_score + 0.35 * (1.0 - brightness_norm)
+
+    nmin, nmax = norm.min(), norm.max()
+    if nmax - nmin > 1e-6:
+        norm = (norm - nmin) / (nmax - nmin)
+    else:
+        norm = np.zeros_like(norm)
+
+    norm = np.power(norm, 0.7)
     return (min_h + norm * (max_h - min_h)).astype(np.float64)
 
 
@@ -425,7 +955,7 @@ def generate_heightmap(image, label_map, n_colors,
     """
     H, W = label_map.shape
 
-    print("    Computing sculptural base from luminance...")
+    print(f"    Computing sculptural base ({strategy} strategy)...")
     sculpture = compute_sculpture_layer(image, min_h, max_h, strategy)
 
     # Steepness contrast curve
@@ -989,8 +1519,11 @@ def main():
 
     parser.add_argument("input", help="Input image (PNG, JPG, BMP, TIFF)")
     parser.add_argument("-o", "--output", help="Output 3MF path")
-    parser.add_argument("-c", "--colors", type=int, default=8,
-                        help="Number of filament colors (default: 8)")
+    parser.add_argument("-c", "--colors", type=int, default=6,
+                        help="Number of filament colors (default: 6)")
+    parser.add_argument("--filaments",
+                        help="Comma-separated filament color names, or path to .3mf file. "
+                             "Overrides --colors. Example: 'Jade White,Red,Cobalt Blue'")
     parser.add_argument("-r", "--resolution", type=int, default=1525,
                         help="Max pixels on longest edge (default: 1525 = 0.2mm/pixel at 305mm)")
     parser.add_argument("--output-width", type=float, default=305.0,
@@ -1005,9 +1538,9 @@ def main():
                         help="Z offset between paint layers mm (default: 0.4)")
     parser.add_argument("--canvas", type=float, default=0.6,
                         help="Canvas base thickness mm (default: 0.6)")
-    parser.add_argument("--strategy", choices=["brightness", "frequency", "equal"],
-                        default="brightness",
-                        help="Height mapping (default: brightness)")
+    parser.add_argument("--strategy", choices=["depth", "heuristic", "brightness"],
+                        default="depth",
+                        help="Height mapping: depth (AI), heuristic, brightness (default: depth)")
     parser.add_argument("--texture", default="heavy",
                         help="Brushstroke amplitude: preset or mm value")
     parser.add_argument("--steepness", type=float, default=2.0,
@@ -1021,6 +1554,17 @@ def main():
     if not os.path.isfile(args.input):
         print(f"Error: File not found: {args.input}", file=sys.stderr)
         sys.exit(1)
+
+    # Resolve --filaments if provided
+    fixed_indices = None
+    if args.filaments:
+        filaments_arg = args.filaments.strip()
+        if filaments_arg.lower().endswith(".3mf"):
+            fixed_indices = extract_filaments_from_3mf(filaments_arg)
+        else:
+            fixed_indices = resolve_filament_names(filaments_arg)
+        args.colors = len(fixed_indices)
+
     if args.colors < 2 or args.colors > len(BAMBU_PLA_BASIC):
         print(f"Error: Colors must be 2-{len(BAMBU_PLA_BASIC)}", file=sys.stderr)
         sys.exit(1)
@@ -1065,7 +1609,8 @@ def main():
     # --- Stage 2+3: Direct Bambu palette quantization (Lab space) ---
     print(f"[2/6] Quantizing to {args.colors} Bambu PLA colors (Lab space)...")
     label_map, palette, bambu_colors = quantize_to_bambu_palette(
-        image, args.colors, morph_kernel=5, min_area=100)
+        image, args.colors, morph_kernel=5, min_area=100,
+        fixed_indices=fixed_indices)
     n_colors = len(palette)
 
     counts = np.bincount(label_map.ravel(), minlength=n_colors)
